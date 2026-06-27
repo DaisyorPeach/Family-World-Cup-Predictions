@@ -155,7 +155,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f5f3ee;color:#1a1a1a}
       </div>
       <div class="header-btns">
         <span class="fb-dot" id="fb-dot" title="Firebase sync"></span>
-        <button class="live-btn" onclick="syncScores()">
+        <button class="live-btn" onclick="syncScores(true)">
           <span class="ldot" id="ldot"></span>
           <span id="llbl">Sync</span>
         </button>
@@ -367,6 +367,17 @@ function isPlayableRound(roundName){
   return games.every(g => !/[\d\/]/.test(g.team1) && !/[\d\/]/.test(g.team2));
 }
 
+// Is an individual game playable (both team names are resolved, not placeholders)?
+function isPlayableGame(g){
+  return !/[\d\/]/.test(g.team1) && !/[\d\/]/.test(g.team2);
+}
+
+// Does a round have at least one playable game? (used to decide if the round
+// pill / tab should be enabled, even if not every game in it has resolved yet)
+function roundHasAnyPlayable(roundName){
+  return GAMES.filter(g=>g.round===roundName).some(isPlayableGame);
+}
+
 // ═══════════════════════════════════════════════════════
 // FETCH FIXTURES FROM OPENFOOTBALL
 // ═══════════════════════════════════════════════════════
@@ -498,34 +509,53 @@ async function init(){
 // SYNC SCORES — multi-source with Firebase as shared cache
 // ═══════════════════════════════════════════════════════
 
-// Parse scores from worldcup26.ir format (fallback source)
-async function fetchWorldcup26ir() {
-  const res = await fetch('https://worldcup26.ir/get/games?t='+Date.now());
-  if(!res.ok) throw new Error('worldcup26.ir '+res.status);
+// Parse scores from API-Football (fallback source — fast, reliable, free tier)
+const APIFOOTBALL_KEY = 'a7d52ec1797b64a8284e4d61a5c0f7ea';
+
+async function fetchApiFootball() {
+  const res = await fetch(
+    'https://v3.football.api-sports.io/fixtures?league=1&season=2026',
+    { headers: { 'x-apisports-key': APIFOOTBALL_KEY } }
+  );
+  if(!res.ok) throw new Error('API-Football '+res.status);
   const data = await res.json();
   const scores = {};
-  const games = Array.isArray(data) ? data : (data.games||data.matches||[]);
-  games.forEach(m => {
-    const status = (m.status||m.state||'').toLowerCase();
-    const finished = status.includes('finish') || status.includes('ft') || status==='2' || status==='ended';
+  (data.response||[]).forEach(m => {
+    const statusShort = m.fixture?.status?.short || '';
+    const finished = ['FT','AET','PEN'].includes(statusShort);
     if(!finished) return;
-    const h = m.home_score ?? m.home_goals ?? m.score_home ?? null;
-    const a = m.away_score ?? m.away_goals ?? m.score_away ?? null;
-    if(h==null||a==null) return;
-    // Try to match team names to our GAMES list
-    const homeN = m.home_team?.name || m.home_team || m.home || '';
-    const awayN = m.away_team?.name || m.away_team || m.away || '';
+
+    const homeN = m.teams?.home?.name || '';
+    const awayN = m.teams?.away?.name || '';
     const game = GAMES.find(g =>
       g.team1.toLowerCase()===homeN.toLowerCase() ||
-      g.team1.toLowerCase().includes(homeN.toLowerCase().split(' ')[0].toLowerCase()) ||
-      homeN.toLowerCase().includes(g.team1.toLowerCase().split(' ')[0].toLowerCase())
+      g.team1.toLowerCase().split(' ')[0]===homeN.toLowerCase().split(' ')[0]
     );
-    if(game) scores[game.key] = [parseInt(h), parseInt(a)];
+    if(!game) return;
+
+    const ft = m.score?.fulltime;
+    const et = m.score?.extratime;
+    const pen = m.score?.penalty;
+
+    if(pen && pen.home!=null && pen.away!=null){
+      // Combined total = extra-time score (or fulltime if no ET) + penalty score
+      const base = (et && et.home!=null) ? et : ft;
+      if(base && base.home!=null){
+        const combined = [base.home+pen.home, base.away+pen.away];
+        const penWinner = pen.home>pen.away?'home':'away';
+        scores[game.key] = [...combined, penWinner];
+      }
+    } else if(ft && ft.home!=null){
+      scores[game.key] = [ft.home, ft.away];
+    }
   });
   return scores;
 }
 
-async function syncScores(){
+let lastApiFootballCall = 0;
+const APIFOOTBALL_MIN_INTERVAL = 8 * 60 * 1000; // 8 minutes between fallback calls
+
+async function syncScores(forceFullCheck){
   const dot=document.getElementById('ldot'), lbl=document.getElementById('llbl');
   dot.classList.add('pulse'); lbl.textContent='Syncing';
 
@@ -572,14 +602,21 @@ async function syncScores(){
     }
   } catch(e){ console.warn('openfootball failed:', e); }
 
-  // Source 2: worldcup26.ir fallback — fills in anything openfootball missed
-  try {
-    const fallback = await fetchWorldcup26ir();
-    // Only use fallback score if openfootball didn't have it
-    for(const [k,v] of Object.entries(fallback)){
-      if(!newScores[k]) { newScores[k]=v; source='fallback'; }
-    }
-  } catch(e){ console.warn('worldcup26.ir failed:', e); }
+  // Source 2: API-Football fallback — fills in anything openfootball missed
+  // Free tier is 100 req/day, so throttle it: only call when there's something
+  // pending AND it's been a while since the last fallback call (or user forced it)
+  const hasPendingGames = GAMES.some(g => isPlayableGame(g) && actual[g.key]==null && newScores[g.key]==null);
+  const timeSinceLastCall = Date.now() - lastApiFootballCall;
+  const shouldCallFallback = hasPendingGames && (forceFullCheck || timeSinceLastCall > APIFOOTBALL_MIN_INTERVAL);
+  if(shouldCallFallback){
+    lastApiFootballCall = Date.now();
+    try {
+      const fallback = await fetchApiFootball();
+      for(const [k,v] of Object.entries(fallback)){
+        if(!newScores[k]) { newScores[k]=v; source = source||'apifootball'; }
+      }
+    } catch(e){ console.warn('API-Football fallback failed:', e); }
+  }
 
   // Merge into actual{}, track what's genuinely new
   const changedScores = {};
@@ -732,24 +769,36 @@ function renderWho(){
 function renderRoundTabs(){
   document.getElementById('pick-round-tabs').innerHTML=`<div class="round-tabs">${
     ROUNDS.map(r=>{
-      const playable=isPlayableRound(r);
-      return`<button class="round-pill${activeRound===r?' on':''}${!playable?' future':''}" onclick="setRound('${r}')">${r.replace('Group Stage — ','').replace('Match for third place','3rd Place')}</button>`;
+      const anyPlayable=roundHasAnyPlayable(r);
+      return`<button class="round-pill${activeRound===r?' on':''}${!anyPlayable?' future':''}" onclick="setRound('${r}')">${r.replace('Group Stage — ','').replace('Match for third place','3rd Place')}</button>`;
     }).join('')
   }</div>`;
 }
 
 function renderPickGames(){
   if(!activePid){ document.getElementById('pick-games').innerHTML=''; return; }
-  const playable=isPlayableRound(activeRound);
-  const locked = activePid && GAMES.filter(g=>g.round===activeRound).some(g=>isGameLocked(activePid,g.key));
-  document.getElementById('lock-banner').style.display=locked?'block':'none';
-  document.getElementById('future-banner').style.display=!playable?'block':'none';
-  document.getElementById('save-footer').classList.toggle('show',!!activePid&&playable);
-
-  if(!playable){ document.getElementById('pick-games').innerHTML=''; return; }
-
   const games=GAMES.filter(g=>g.round===activeRound);
+  const anyPlayable = games.some(isPlayableGame);
+  const locked = GAMES.filter(g=>g.round===activeRound).some(g=>isGameLocked(activePid,g.key));
+  document.getElementById('lock-banner').style.display=locked?'block':'none';
+  document.getElementById('future-banner').style.display=!anyPlayable?'block':'none';
+  document.getElementById('save-footer').classList.toggle('show',!!activePid&&anyPlayable);
+
+  if(!anyPlayable){ document.getElementById('pick-games').innerHTML=''; return; }
+
   document.getElementById('pick-games').innerHTML=games.map((g,i)=>{
+    const gPlayable = isPlayableGame(g);
+    if(!gPlayable){
+      // Show a disabled placeholder card for fixtures not yet confirmed
+      return`<div class="pred-game" style="opacity:0.5">
+        <div class="pred-game-matchup">
+          <div class="pred-g-team"><div class="g-flag">${flag(g.team1)}</div><div class="g-name">${g.team1}</div></div>
+          <div class="input-row"><span class="inp-sep">vs</span></div>
+          <div class="pred-g-team"><div class="g-flag">${flag(g.team2)}</div><div class="g-name">${g.team2}</div></div>
+        </div>
+        <div class="game-status">Fixture not confirmed yet</div>
+      </div>`;
+    }
     const isL=isGameLocked(activePid,g.key);
     const apiDone=actual[g.key]!=null;
     const pr=preds[activePid]?.[g.key];
