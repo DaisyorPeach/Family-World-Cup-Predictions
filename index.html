@@ -211,7 +211,8 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f5f3ee;color:#1a1a1a}
       • Locked predictions can't be changed<br>
       • New rounds appear automatically as the tournament progresses<br>
       • Scores sync live from the football database<br>
-      • The leaderboard updates as games finish
+      • The leaderboard updates as games finish<br>
+      • <strong>Knockout games decided on penalties:</strong> the score that counts is extra-time goals + penalty shootout goals added together per team (e.g. 2–2 after extra time, won 4–3 on pens → counts as 6–5). Guess that combined total exactly for 3 pts, just the winning team for 2 pts, or one team's number exactly for 1 pt.
     </div>
   </div>
 </div>
@@ -392,19 +393,32 @@ async function fetchFixtures(){
   // Sort all matches chronologically by UTC kickoff
   matches.sort((a, b) => toUTC(a) - toUTC(b));
 
-  GAMES = matches.map(m => ({
-    key: gameKey(m.team1, m.team2),
-    team1: m.team1,
-    team2: m.team2,
-    round: classifyRound(m),
-    date: m.date || '',
-    score: m.score?.ft || null,   // [home, away] or null
-  }));
+  GAMES = matches.map(m => {
+    const ft = m.score?.ft || null;       // 90-min score
+    const et = m.score?.et || null;       // score at end of extra time (cumulative, includes ft)
+    const pen = m.score?.p || null;       // penalty shootout score (standalone)
+    let combined = null;                  // et + pen, per team — the "full" score for penalty games
+    let penWinner = null;                 // 'home' | 'away'
+    if(pen){
+      const base = et || ft || [0,0];
+      combined = [base[0] + pen[0], base[1] + pen[1]];
+      penWinner = pen[0] > pen[1] ? 'home' : 'away';
+    }
+    return {
+      key: gameKey(m.team1, m.team2),
+      team1: m.team1,
+      team2: m.team2,
+      round: classifyRound(m),
+      date: m.date || '',
+      score: combined || ft,   // use combined total if penalties happened, else normal ft score
+      penWinner,
+    };
+  });
 
-  // Extract scores into actual{}
+  // Extract scores into actual{} — store as [home, away, penWinner?] when relevant
   const newScores = {};
   GAMES.forEach(g => {
-    if(g.score) newScores[g.key] = g.score;
+    if(g.score) newScores[g.key] = g.penWinner ? [...g.score, g.penWinner] : g.score;
   });
 
   // Unique rounds in order
@@ -442,7 +456,8 @@ async function init(){
       preds[pid] = { ...(BASE_PREDS[pid]||{}), ...(fbData.preds[pid]||{}) };
     }
 
-    // 4. Merge actual scores: Firebase → live scores override
+    // 4. Merge actual scores: Firebase first, then live scores override
+    // Firebase scores = already-confirmed scores shared by whoever synced last
     actual = { ...(fbData.actual||{}), ...liveScores };
 
     // 5. Locked rounds
@@ -476,34 +491,116 @@ async function init(){
   document.getElementById('loading').style.display='none';
   renderAll();
   // Auto sync scores every 5 min
-  setInterval(syncScores, 5*60*1000);
+  setInterval(syncScores, 2*60*1000);
 }
 
 // ═══════════════════════════════════════════════════════
-// SYNC SCORES
+// SYNC SCORES — multi-source with Firebase as shared cache
 // ═══════════════════════════════════════════════════════
+
+// Parse scores from worldcup26.ir format (fallback source)
+async function fetchWorldcup26ir() {
+  const res = await fetch('https://worldcup26.ir/get/games?t='+Date.now());
+  if(!res.ok) throw new Error('worldcup26.ir '+res.status);
+  const data = await res.json();
+  const scores = {};
+  const games = Array.isArray(data) ? data : (data.games||data.matches||[]);
+  games.forEach(m => {
+    const status = (m.status||m.state||'').toLowerCase();
+    const finished = status.includes('finish') || status.includes('ft') || status==='2' || status==='ended';
+    if(!finished) return;
+    const h = m.home_score ?? m.home_goals ?? m.score_home ?? null;
+    const a = m.away_score ?? m.away_goals ?? m.score_away ?? null;
+    if(h==null||a==null) return;
+    // Try to match team names to our GAMES list
+    const homeN = m.home_team?.name || m.home_team || m.home || '';
+    const awayN = m.away_team?.name || m.away_team || m.away || '';
+    const game = GAMES.find(g =>
+      g.team1.toLowerCase()===homeN.toLowerCase() ||
+      g.team1.toLowerCase().includes(homeN.toLowerCase().split(' ')[0].toLowerCase()) ||
+      homeN.toLowerCase().includes(g.team1.toLowerCase().split(' ')[0].toLowerCase())
+    );
+    if(game) scores[game.key] = [parseInt(h), parseInt(a)];
+  });
+  return scores;
+}
+
 async function syncScores(){
   const dot=document.getElementById('ldot'), lbl=document.getElementById('llbl');
   dot.classList.add('pulse'); lbl.textContent='Syncing';
+
+  let newScores = {};
+  let updated = 0;
+  let source = '';
+
   try {
-    const liveScores = await fetchFixtures();
-    let updated = 0;
-    const newScores = {};
-    for(const [k,v] of Object.entries(liveScores)){
-      if(!actual[k]||actual[k][0]!==v[0]||actual[k][1]!==v[1]){
-        actual[k]=v; newScores[k]=v; updated++;
+    // Source 1: openfootball (primary — use multiple cache-busters)
+    const rand = Math.random().toString(36).slice(2);
+    const res = await fetch(
+      `https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json?nocache=${rand}&t=${Date.now()}`,
+      { cache: 'no-store', headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' } }
+    );
+    if(res.ok){
+      const data = await res.json();
+      // Re-sort and rebuild GAMES in case new fixtures added
+      const matches = data.matches || [];
+      function toUTC(m) {
+        try {
+          const [h,mn]=m.time.split(' ')[0].split(':').map(Number);
+          const tz=m.time.split(' ')[1]||'UTC+0';
+          const offset=tz==='UTC'?0:parseInt(tz.replace('UTC',''));
+          const base=new Date(m.date+'T00:00:00Z');
+          base.setUTCHours(h-offset,mn);
+          return base.getTime();
+        } catch(e){ return new Date(m.date||'2099-01-01').getTime(); }
       }
+      matches.sort((a,b)=>toUTC(a)-toUTC(b));
+      matches.forEach(m => {
+        if(m.score?.ft){
+          const pen = m.score?.p || null;
+          if(pen){
+            const base = m.score?.et || m.score.ft;
+            const combined = [base[0]+pen[0], base[1]+pen[1]];
+            const penWinner = pen[0]>pen[1]?'home':'away';
+            newScores[gameKey(m.team1,m.team2)] = [...combined, penWinner];
+          } else {
+            newScores[gameKey(m.team1,m.team2)] = m.score.ft;
+          }
+        }
+      });
+      source = 'openfootball';
     }
-    if(updated>0&&fbConnected) await fbPatch('actualScores',newScores).catch(()=>{});
-    renderAll();
-    dot.classList.remove('pulse');
-    lbl.textContent=updated>0?`${updated} new ✓`:'Live ✓';
-    if(updated>0) showToast(`${updated} score${updated!==1?'s':''} updated! 🎉`);
-  } catch(e){
-    dot.classList.remove('pulse'); lbl.textContent='Error';
-    showToast('Could not reach score source');
+  } catch(e){ console.warn('openfootball failed:', e); }
+
+  // Source 2: worldcup26.ir fallback — fills in anything openfootball missed
+  try {
+    const fallback = await fetchWorldcup26ir();
+    // Only use fallback score if openfootball didn't have it
+    for(const [k,v] of Object.entries(fallback)){
+      if(!newScores[k]) { newScores[k]=v; source='fallback'; }
+    }
+  } catch(e){ console.warn('worldcup26.ir failed:', e); }
+
+  // Merge into actual{}, track what's genuinely new
+  const changedScores = {};
+  for(const [k,v] of Object.entries(newScores)){
+    const old = actual[k];
+    const changed = !old || old[0]!==v[0] || old[1]!==v[1] || old[2]!==v[2];
+    if(changed){
+      actual[k]=v; changedScores[k]=v; updated++;
+    }
   }
-  setTimeout(()=>{lbl.textContent='Sync';},3000);
+
+  // Push changed scores to Firebase so everyone gets them immediately
+  if(Object.keys(changedScores).length > 0 && fbConnected){
+    await fbPatch('actualScores', changedScores).catch(e=>console.warn('FB score push failed:',e));
+  }
+
+  renderAll();
+  dot.classList.remove('pulse');
+  lbl.textContent = updated>0 ? `${updated} new ✓` : 'Live ✓';
+  if(updated>0) showToast(`${updated} score${updated!==1?'s':''} updated! 🎉`);
+  setTimeout(()=>{ lbl.textContent='Sync'; }, 3000);
 }
 
 // ═══════════════════════════════════════════════════════
@@ -512,9 +609,20 @@ async function syncScores(){
 function calcPts(pred,act){
   if(!pred||!act||act[0]==null) return{p:0,t:'pending'};
   const[ph,pa]=[pred[0],pred[1]],[ah,aa]=[act[0],act[1]];
+  const penWinner = act[2] || null; // 'home' | 'away' if decided by penalties
+
+  // act[0]/act[1] already hold the right comparison numbers:
+  // - normal games: the 90-min score
+  // - penalty-shootout games: extra-time score + penalty score combined (per team)
+  // All tiers compare against that same total either way.
   if(ph===ah&&pa===aa) return{p:3,t:'pts3'};
-  const pr=ph>pa?'H':ph<pa?'A':'D',ar=ah>aa?'H':ah<aa?'A':'D';
-  if(pr===ar) return{p:2,t:'pts2'};
+
+  const prResult = ph>pa?'H':ph<pa?'A':'D';
+  // For penalty games there's no draw outcome — use who actually won the shootout.
+  // For normal games, compare the scoreline result as usual.
+  const arResult = penWinner ? (penWinner==='home'?'H':'A') : (ah>aa?'H':ah<aa?'A':'D');
+
+  if(prResult===arResult) return{p:2,t:'pts2'};
   if(ph===ah||pa===aa) return{p:1,t:'pts1'};
   return{p:0,t:'pts0'};
 }
@@ -577,8 +685,10 @@ function renderGames(){
     html+=`<div class="round-header${playable?'':' future'}">${roundName}</div>`;
     games.forEach((g,i)=>{
       const a=actual[g.key],done=a&&a[0]!=null;
+      const wonOnPens = a && a[2]; // 'home' | 'away' if decided by penalties
+      const ftLabel = wonOnPens ? `${a[2]==='home'?g.team1:g.team2} won on pens · prediction total` : 'Full time';
       const scoreHtml=done
-        ?`<div class="scorebox done"><div class="score-num">${a[0]} – ${a[1]}</div><span class="score-lbl">Full time</span></div>`
+        ?`<div class="scorebox done"><div class="score-num">${a[0]} – ${a[1]}</div><span class="score-lbl">${ftLabel}</span></div>`
         :playable
           ?`<div class="scorebox"><div class="score-vs">VS</div><span class="score-lbl">${g.date?new Date(g.date).toLocaleDateString('en-AU',{day:'numeric',month:'short'}):''}</span></div>`
           :`<div class="scorebox future"><div class="score-vs" style="font-size:10px;color:#c5bfb5">TBD</div></div>`;
@@ -646,7 +756,11 @@ function renderPickGames(){
     const h=pr?.[0]??'', av=pr?.[1]??'';
     const dis=isL?'disabled':'';
     let status;
-    if(apiDone) status=`<div class="game-status api">⚽ Final: ${actual[g.key][0]}–${actual[g.key][1]}</div>`;
+    if(apiDone){
+      const a=actual[g.key];
+      const pensText = a[2] ? ` (${a[2]==='home'?g.team1:g.team2} won on pens)` : '';
+      status=`<div class="game-status api">⚽ Final: ${a[0]}–${a[1]}${pensText}</div>`;
+    }
     else if(isL) status=`<div class="game-status ok">✓ Locked in</div>`;
     else status=`<div class="game-status">Game ${i+1} — enter your prediction</div>`;
     return`<div class="pred-game">
