@@ -442,12 +442,94 @@ async function fetchFixtures(){
 }
 
 // ═══════════════════════════════════════════════════════
+// RESOLVE KNOCKOUT TEAM NAMES FROM API-FOOTBALL
+// openfootball updates its bracket by hand ~once/day, so it can lag the
+// real announced fixtures. API-Football is professionally maintained and
+// usually has resolved Round of 32+ team names as soon as FIFA confirms them.
+// This fills in any placeholder games in GAMES with real team names.
+// ═══════════════════════════════════════════════════════
+
+async function resolveKnockoutTeamsFromApiFootball(){
+  // Only bother if there are still placeholder games in any knockout round
+  const knockoutRounds = ['Round of 32','Round of 16','Quarter-finals','Semi-finals','Match for third place','Final'];
+  const hasPlaceholders = GAMES.some(g => knockoutRounds.includes(g.round) && !isPlayableGame(g));
+  if(!hasPlaceholders) return false;
+
+  try {
+    const res = await fetch('https://v3.football.api-sports.io/fixtures?league=1&season=2026', {
+      headers: { 'x-apisports-key': APIFOOTBALL_KEY }
+    });
+    if(!res.ok) return false;
+    const data = await res.json();
+    const fixtures = data.response || [];
+
+    // Normalise round name from API-Football into our round naming
+    function mapRound(roundRaw){
+      const r = (roundRaw||'').toLowerCase();
+      if(r.includes('32')) return 'Round of 32';
+      if(r.includes('16')) return 'Round of 16';
+      if(r.includes('quarter')) return 'Quarter-finals';
+      if(r.includes('semi')) return 'Semi-finals';
+      if(r.includes('third') || r.includes('3rd')) return 'Match for third place';
+      if(r.includes('final') && !r.includes('semi') && !r.includes('quarter')) return 'Final';
+      return null;
+    }
+
+    // Resolved fixtures from API-Football, grouped by our round name, in their listed order
+    const resolvedByRound = {};
+    fixtures.forEach(f => {
+      const homeN = f.teams?.home?.name;
+      const awayN = f.teams?.away?.name;
+      if(!homeN || !awayN) return; // still unresolved on API-Football's side too
+      const ourRound = mapRound(f.league?.round);
+      if(!ourRound) return;
+      if(!resolvedByRound[ourRound]) resolvedByRound[ourRound] = [];
+      resolvedByRound[ourRound].push({ team1: homeN, team2: awayN });
+    });
+
+    let resolvedAny = false;
+
+    for(const roundName of knockoutRounds){
+      const resolved = resolvedByRound[roundName];
+      if(!resolved || !resolved.length) continue;
+
+      const ourGames = GAMES.filter(g => g.round === roundName);
+
+      resolved.forEach(rf => {
+        // Skip if we already have this exact matchup resolved
+        const already = ourGames.some(g => isPlayableGame(g) &&
+          ((g.team1===rf.team1 && g.team2===rf.team2) || (g.team1===rf.team2 && g.team2===rf.team1)));
+        if(already) return;
+
+        // Find the next unresolved placeholder game in this round to fill
+        const target = ourGames.find(g => !isPlayableGame(g));
+        if(target){
+          target.team1 = rf.team1;
+          target.team2 = rf.team2;
+          target.key = gameKey(rf.team1, rf.team2);
+          resolvedAny = true;
+        }
+      });
+    }
+
+    return resolvedAny;
+  } catch(e){
+    console.warn('Could not resolve knockout teams from API-Football:', e);
+    return false;
+  }
+}
+
+// ═══════════════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════════════
 async function init(){
   try {
     // 1. Fetch fixtures + live scores
     const liveScores = await fetchFixtures();
+
+    // 1b. Resolve any knockout placeholder teams using API-Football
+    // (openfootball updates by hand ~once/day and can lag real announcements)
+    await resolveKnockoutTeamsFromApiFootball();
 
     // 2. Load Firebase data
     let fbData = { preds:{}, actual:{}, locked:{} };
@@ -585,6 +667,20 @@ async function syncScores(forceFullCheck){
         } catch(e){ return new Date(m.date||'2099-01-01').getTime(); }
       }
       matches.sort((a,b)=>toUTC(a)-toUTC(b));
+
+      // Merge any new fixtures (e.g. resolved knockout games) into GAMES
+      const existingKeys = new Set(GAMES.map(g=>g.key));
+      matches.forEach(m => {
+        const k = gameKey(m.team1, m.team2);
+        if(!existingKeys.has(k)){
+          GAMES.push({
+            key: k, team1: m.team1, team2: m.team2,
+            round: classifyRound(m), date: m.date || '', score: null, penWinner: null,
+          });
+          existingKeys.add(k);
+        }
+      });
+
       matches.forEach(m => {
         if(m.score?.ft){
           const pen = m.score?.p || null;
@@ -601,6 +697,10 @@ async function syncScores(forceFullCheck){
       source = 'openfootball';
     }
   } catch(e){ console.warn('openfootball failed:', e); }
+
+  // Resolve any still-placeholder knockout games using API-Football
+  // (cheap to check — only makes a real request if placeholders exist)
+  try { await resolveKnockoutTeamsFromApiFootball(); } catch(e){}
 
   // Source 2: API-Football fallback — fills in anything openfootball missed
   // Free tier is 100 req/day, so throttle it: only call when there's something
