@@ -646,11 +646,12 @@ async function syncScores(forceFullCheck){
   let source = '';
 
   try {
-    // Source 1: openfootball (primary — use multiple cache-busters)
+    // Source 1: openfootball (primary — cache-bust via URL only, no custom
+    // headers, since custom headers trigger a CORS preflight that
+    // raw.githubusercontent.com does not handle, causing the fetch to fail)
     const rand = Math.random().toString(36).slice(2);
     const res = await fetch(
-      `https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json?nocache=${rand}&t=${Date.now()}`,
-      { cache: 'no-store', headers: { 'Cache-Control': 'no-cache', 'Pragma': 'no-cache' } }
+      `https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json?nocache=${rand}&t=${Date.now()}`
     );
     if(res.ok){
       const data = await res.json();
