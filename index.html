@@ -58,6 +58,10 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f5f3ee;color:#1a1a1a}
 .pc-pts-lbl{font-size:8px;color:#9a9488;font-weight:700;text-transform:uppercase;letter-spacing:0.06em}
 /* GAMES */
 .round-header{font-family:'Bebas Neue',sans-serif;font-size:16px;letter-spacing:1px;color:#1c3d24;margin:18px 0 8px;display:flex;align-items:center;gap:8px}
+.round-badge{font-family:'Inter',sans-serif;font-size:9px;font-weight:800;letter-spacing:0.05em;text-transform:uppercase;padding:3px 8px;border-radius:10px;flex-shrink:0}
+.round-badge.current{background:#1c3d24;color:#c9a13a}
+.round-badge.done{background:#e5e2da;color:#6b6b66}
+.round-badge.upcoming{background:#f5f3ee;color:#c5bfb5;border:1px dashed #c5bfb5}
 .round-header::after{content:'';flex:1;height:1px;background:#e5e2da}
 .round-header.future{color:#c5bfb5}
 .game-card{background:#fff;border:1px solid #e5e2da;border-radius:12px;margin-bottom:8px;overflow:hidden}
@@ -321,6 +325,121 @@ const BASE_PREDS={
 };
 
 // ═══════════════════════════════════════════════════════
+// CONFIRMED ROUND OF 32 BRACKET (hardcoded — verified June 28, 2026)
+// openfootball updates its bracket by hand ~once/day and can lag real
+// announcements. This locked-in list guarantees the Round of 32 shows
+// correctly even before the auto-sources catch up. Matched against any
+// placeholder game in GAMES by position once the round is loaded.
+// ═══════════════════════════════════════════════════════
+const CONFIRMED_R32 = [
+  ['South Africa','Canada'],
+  ['Mexico','Ecuador'],
+  ['Switzerland','Algeria'],
+  ['USA','Bosnia & Herzegovina'],
+  ['Brazil','Japan'],
+  ['Netherlands','Morocco'],
+  ['Germany','Paraguay'],
+  ['Ivory Coast','Norway'],
+  ['France','Sweden'],
+  ['Belgium','Senegal'],
+  ['Australia','Egypt'],
+  ['Argentina','Cape Verde'],
+  ['Austria','Spain'],
+  ['England','DR Congo'],
+  ['Croatia','Portugal'],
+  ['Colombia','Ghana'],
+];
+
+// Apply the confirmed bracket: replace placeholder Round of 32 games with
+// real team names. Matches by checking which confirmed matchups are not yet
+// present anywhere in the round (by team names), then fills remaining
+// placeholder slots with those missing matchups in order. This avoids
+// creating duplicate games when some fixtures are already resolved.
+function teamsMatch(a1, a2, b1, b2){
+  return (a1===b1 && a2===b2) || (a1===b2 && a2===b1);
+}
+
+function applyConfirmedR32(){
+  const r32Games = GAMES.filter(g => g.round === 'Round of 32');
+  if(!r32Games.length) return false;
+
+  const missing = CONFIRMED_R32.filter(([t1,t2]) =>
+    !r32Games.some(g => isPlayableGame(g) && teamsMatch(g.team1, g.team2, t1, t2))
+  );
+
+  const placeholders = r32Games.filter(g => !isPlayableGame(g));
+  let changed = false;
+  placeholders.forEach((g, i) => {
+    const fill = missing[i];
+    if(!fill) return;
+    g.team1 = fill[0];
+    g.team2 = fill[1];
+    g.key = gameKey(fill[0], fill[1]);
+    changed = true;
+  });
+  return changed;
+}
+
+// ═══════════════════════════════════════════════════════
+// ROUND OF 16 SLOT MAP (hardcoded — verified bracket structure)
+// Each entry says "the winner of R32 matchup X plays the winner of R32
+// matchup Y". This lets Round of 16 resolve automatically the moment both
+// feeder games finish — no API needed, since the slot pairing itself
+// (not just the teams) is fixed and already known.
+// ═══════════════════════════════════════════════════════
+const R16_SLOT_MAP = [
+  [['South Africa','Canada'], ['Netherlands','Morocco']],
+  [['Germany','Paraguay'], ['France','Sweden']],
+  [['Brazil','Japan'], ['Ivory Coast','Norway']],
+  [['Mexico','Ecuador'], ['England','DR Congo']],
+  [['Austria','Spain'], ['Croatia','Portugal']],
+  [['Belgium','Senegal'], ['USA','Bosnia & Herzegovina']],
+  [['Australia','Egypt'], ['Argentina','Cape Verde']],
+  [['Switzerland','Algeria'], ['Colombia','Ghana']],
+];
+
+// Given a R32 matchup (by team names), find that game in GAMES and return
+// the winning team name, or null if not finished yet.
+function getR32Winner(team1, team2){
+  const game = GAMES.find(g => g.round === 'Round of 32' && teamsMatch(g.team1, g.team2, team1, team2));
+  if(!game) return null;
+  const a = actual[game.key];
+  if(!a || a[0] == null) return null;
+  if(a[2]) return a[2] === 'home' ? game.team1 : game.team2; // penalty winner
+  if(a[0] > a[1]) return game.team1;
+  if(a[1] > a[0]) return game.team2;
+  return null; // genuine draw shouldn't happen in a knockout, but guard anyway
+}
+
+function applyConfirmedR16(){
+  const r16Games = GAMES.filter(g => g.round === 'Round of 16');
+  if(!r16Games.length) return false;
+
+  const resolvedSlots = [];
+  R16_SLOT_MAP.forEach(([feederA, feederB]) => {
+    const winnerA = getR32Winner(feederA[0], feederA[1]);
+    const winnerB = getR32Winner(feederB[0], feederB[1]);
+    if(winnerA && winnerB) resolvedSlots.push([winnerA, winnerB]);
+  });
+
+  const missing = resolvedSlots.filter(([t1,t2]) =>
+    !r16Games.some(g => isPlayableGame(g) && teamsMatch(g.team1, g.team2, t1, t2))
+  );
+
+  const placeholders = r16Games.filter(g => !isPlayableGame(g));
+  let changed = false;
+  placeholders.forEach((g, i) => {
+    const fill = missing[i];
+    if(!fill) return;
+    g.team1 = fill[0];
+    g.team2 = fill[1];
+    g.key = gameKey(fill[0], fill[1]);
+    changed = true;
+  });
+  return changed;
+}
+
+// ═══════════════════════════════════════════════════════
 // STATE
 // ═══════════════════════════════════════════════════════
 let GAMES = [];           // loaded dynamically from openfootball
@@ -527,9 +646,9 @@ async function init(){
     // 1. Fetch fixtures + live scores
     const liveScores = await fetchFixtures();
 
-    // 1b. Resolve any knockout placeholder teams using API-Football
-    // (openfootball updates by hand ~once/day and can lag real announcements)
-    await resolveKnockoutTeamsFromApiFootball();
+    // 1b. Apply the confirmed Round of 32 bracket (hardcoded, verified) —
+    // overrides any placeholder games openfootball hasn't caught up on yet.
+    applyConfirmedR32();
 
     // 2. Load Firebase data
     let fbData = { preds:{}, actual:{}, locked:{} };
@@ -552,6 +671,11 @@ async function init(){
     // 4. Merge actual scores: Firebase first, then live scores override
     // Firebase scores = already-confirmed scores shared by whoever synced last
     actual = { ...(fbData.actual||{}), ...liveScores };
+
+    // 4b. Now that actual scores are loaded, resolve Round of 16 (and beyond)
+    // using the hardcoded slot map, plus API-Football as a secondary check.
+    applyConfirmedR16();
+    await resolveKnockoutTeamsFromApiFootball();
 
     // 5. Locked rounds
     for(const pid of Object.keys(fbData.locked||{})){
@@ -699,9 +823,9 @@ async function syncScores(forceFullCheck){
     }
   } catch(e){ console.warn('openfootball failed:', e); }
 
-  // Resolve any still-placeholder knockout games using API-Football
-  // (cheap to check — only makes a real request if placeholders exist)
-  try { await resolveKnockoutTeamsFromApiFootball(); } catch(e){}
+  // Apply the confirmed Round of 32 bracket in case openfootball reset any
+  // placeholder games back
+  applyConfirmedR32();
 
   // Source 2: API-Football fallback — fills in anything openfootball missed
   // Free tier is 100 req/day, so throttle it: only call when there's something
@@ -728,6 +852,11 @@ async function syncScores(forceFullCheck){
       actual[k]=v; changedScores[k]=v; updated++;
     }
   }
+
+  // Now that actual scores reflect this sync's results, resolve Round of 16
+  // (and beyond) using the hardcoded slot map, plus API-Football as backup
+  applyConfirmedR16();
+  try { await resolveKnockoutTeamsFromApiFootball(); } catch(e){}
 
   // Push changed scores to Firebase so everyone gets them immediately
   if(Object.keys(changedScores).length > 0 && fbConnected){
@@ -815,12 +944,57 @@ function renderLB(){
     </div>`).join('');
 }
 
+// Is every game in a round finished (has a final score)?
+function isRoundComplete(roundName){
+  const games = GAMES.filter(g => g.round === roundName);
+  if(!games.length) return false;
+  return games.every(g => actual[g.key] != null && actual[g.key][0] != null);
+}
+
+// Does a round have at least one finished game? (used to find "current" stage)
+function roundHasAnyResult(roundName){
+  return GAMES.filter(g => g.round === roundName).some(g => actual[g.key] != null && actual[g.key][0] != null);
+}
+
+// Build the display order for the Games page:
+// 1. The "current" stage — the earliest round (in tournament order) that has
+//    started but isn't fully finished yet (or, if none has started, the
+//    very first round)
+// 2. Completed stages, most recently completed first (reverse chronological)
+// 3. Future stages, in normal tournament order
+function getGamesDisplayOrder(){
+  const inOrder = [...ROUNDS]; // already sorted by roundSort (tournament order)
+  const completed = inOrder.filter(isRoundComplete);
+  const notCompleted = inOrder.filter(r => !isRoundComplete(r));
+
+  // Current = first not-yet-complete round in tournament order (the round
+  // that's "in progress" — earliest unfinished one is the active stage)
+  const current = notCompleted[0] || inOrder[inOrder.length-1];
+  const future = notCompleted.slice(1);
+
+  // Completed stages shown most-recent-first (reverse of tournament order)
+  const completedReversed = [...completed].reverse();
+
+  const order = [];
+  if(current) order.push(current);
+  order.push(...completedReversed);
+  order.push(...future);
+  return order;
+}
+
 function renderGames(){
   let html='';
-  ROUNDS.forEach(roundName=>{
+  const displayOrder = getGamesDisplayOrder();
+  displayOrder.forEach((roundName, idx)=>{
     const games=GAMES.filter(g=>g.round===roundName);
     const playable=isPlayableRound(roundName);
-    html+=`<div class="round-header${playable?'':' future'}">${roundName}</div>`;
+    const complete=isRoundComplete(roundName);
+    const isCurrent = idx===0 && !complete;
+    let badge='';
+    if(isCurrent) badge='<span class="round-badge current">In progress</span>';
+    else if(complete) badge='<span class="round-badge done">Completed</span>';
+    else if(!playable) badge='<span class="round-badge upcoming">Fixtures TBD</span>';
+    html+=`<div class="round-header${playable?'':' future'}">${roundName}${badge}</div>`;
     games.forEach((g,i)=>{
       const a=actual[g.key],done=a&&a[0]!=null;
       const wonOnPens = a && a[2]; // 'home' | 'away' if decided by penalties
