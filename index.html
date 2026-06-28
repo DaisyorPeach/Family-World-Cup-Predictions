@@ -12,7 +12,7 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f5f3ee;color:#1a1a1a}
 .header{position:sticky;top:0;z-index:100;background:#fff;border-bottom:1px solid #e5e2da}
 .hero-band{background:#1c3d24;padding:14px 14px 0;position:relative;overflow:hidden}
 .hero-band::before{content:'';position:absolute;inset:0;background:repeating-linear-gradient(90deg,transparent 0,transparent 39px,rgba(255,255,255,0.03) 39px,rgba(255,255,255,0.03) 41px),repeating-linear-gradient(0deg,transparent 0,transparent 39px,rgba(255,255,255,0.03) 39px,rgba(255,255,255,0.03) 41px);pointer-events:none}
-.hero-inner{display:flex;align-items:center;gap:10px;margin-bottom:14px;position:relative}
+.hero-inner{display:flex;align-items:center;gap:10px;margin-bottom:14px;position:relative;max-width:480px;margin-left:auto;margin-right:auto}
 .trophy-badge{width:42px;height:42px;background:#c9a13a;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
 .comp-name{font-family:'Bebas Neue',sans-serif;font-size:22px;letter-spacing:2px;color:#fff;line-height:1}
 .comp-sub{font-size:10px;color:rgba(255,255,255,0.5);letter-spacing:0.06em;margin-top:2px}
@@ -24,11 +24,11 @@ body{font-family:'Inter',system-ui,sans-serif;background:#f5f3ee;color:#1a1a1a}
 .fb-dot.connected{background:#4ade80}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0.1}}
 .turf{height:5px;background:repeating-linear-gradient(90deg,#2d7a3a 0,#2d7a3a 18px,#256830 18px,#256830 36px)}
-.nav{display:flex;background:#fff}
+.nav{display:flex;background:#fff;max-width:480px;margin:0 auto}
 .ntab{flex:1;padding:10px 4px 9px;background:none;border:none;border-top:2px solid transparent;color:#9a9488;font-size:9px;font-weight:800;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:2px;letter-spacing:0.05em;text-transform:uppercase;transition:color 0.12s}
 .ntab .ni{font-size:18px}
 .ntab.on{color:#1c3d24;border-top-color:#c9a13a}
-.page{display:none;padding:14px 14px 80px}
+.page{display:none;padding:14px 14px 80px;max-width:480px;margin:0 auto}
 .page.on{display:block}
 /* STAT STRIP */
 .stat-strip{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
@@ -779,44 +779,29 @@ async function syncScores(forceFullCheck){
     );
     if(res.ok){
       const data = await res.json();
-      // Re-sort and rebuild GAMES in case new fixtures added
       const matches = data.matches || [];
-      function toUTC(m) {
-        try {
-          const [h,mn]=m.time.split(' ')[0].split(':').map(Number);
-          const tz=m.time.split(' ')[1]||'UTC+0';
-          const offset=tz==='UTC'?0:parseInt(tz.replace('UTC',''));
-          const base=new Date(m.date+'T00:00:00Z');
-          base.setUTCHours(h-offset,mn);
-          return base.getTime();
-        } catch(e){ return new Date(m.date||'2099-01-01').getTime(); }
-      }
-      matches.sort((a,b)=>toUTC(a)-toUTC(b));
 
-      // Merge any new fixtures (e.g. resolved knockout games) into GAMES
-      const existingKeys = new Set(GAMES.map(g=>g.key));
+      // Extract scores ONLY — never rebuild or push new fixtures into GAMES
+      // here. GAMES is built once on init() and patched only by
+      // applyConfirmedR32/R16 (hardcoded, reliable). Re-merging openfootball's
+      // raw (often placeholder-laden) fixture list on every sync caused
+      // duplicate placeholder games to reappear after being resolved.
       matches.forEach(m => {
-        const k = gameKey(m.team1, m.team2);
-        if(!existingKeys.has(k)){
-          GAMES.push({
-            key: k, team1: m.team1, team2: m.team2,
-            round: classifyRound(m), date: m.date || '', score: null, penWinner: null,
-          });
-          existingKeys.add(k);
-        }
-      });
+        if(!m.score?.ft) return;
+        // Find the matching game in GAMES by team name (handles the case
+        // where our key differs from openfootball's if names were resolved
+        // via the hardcoded bracket instead of by openfootball itself)
+        const game = GAMES.find(g => teamsMatch(g.team1, g.team2, m.team1, m.team2));
+        if(!game) return; // unknown fixture (e.g. still a placeholder for us) — skip
 
-      matches.forEach(m => {
-        if(m.score?.ft){
-          const pen = m.score?.p || null;
-          if(pen){
-            const base = m.score?.et || m.score.ft;
-            const combined = [base[0]+pen[0], base[1]+pen[1]];
-            const penWinner = pen[0]>pen[1]?'home':'away';
-            newScores[gameKey(m.team1,m.team2)] = [...combined, penWinner];
-          } else {
-            newScores[gameKey(m.team1,m.team2)] = m.score.ft;
-          }
+        const pen = m.score?.p || null;
+        if(pen){
+          const base = m.score?.et || m.score.ft;
+          const combined = [base[0]+pen[0], base[1]+pen[1]];
+          const penWinner = pen[0]>pen[1]?'home':'away';
+          newScores[game.key] = [...combined, penWinner];
+        } else {
+          newScores[game.key] = m.score.ft;
         }
       });
       source = 'openfootball';
