@@ -534,14 +534,20 @@ async function fetchFixtures(){
       combined = [base[0] + pen[0], base[1] + pen[1]];
       penWinner = pen[0] > pen[1] ? 'home' : 'away';
     }
+    // Use the most complete score available:
+    // - penalties: combined (ET + pen)
+    // - extra time only (won in ET, no pens): use ET score as final
+    // - normal 90-min result: use FT score
+    const finalScore = combined || et || ft;
     return {
       key: gameKey(m.team1, m.team2),
       team1: m.team1,
       team2: m.team2,
       round: classifyRound(m),
       date: m.date || '',
-      score: combined || ft,   // use combined total if penalties happened, else normal ft score
+      score: finalScore,
       penWinner,
+      hadET: !!et && !pen, // true if game was decided in ET (not pens)
     };
   });
 
@@ -744,13 +750,16 @@ async function fetchApiFootball() {
     const pen = m.score?.penalty;
 
     if(pen && pen.home!=null && pen.away!=null){
-      // Combined total = extra-time score (or fulltime if no ET) + penalty score
+      // Penalties: ET score + penalty score combined per team
       const base = (et && et.home!=null) ? et : ft;
       if(base && base.home!=null){
         const combined = [base.home+pen.home, base.away+pen.away];
         const penWinner = pen.home>pen.away?'home':'away';
         scores[game.key] = [...combined, penWinner];
       }
+    } else if(et && et.home!=null && (et.home!==ft?.home || et.away!==ft?.away)){
+      // Extra time only (score changed in ET, no penalties): use ET score as final
+      scores[game.key] = [et.home, et.away];
     } else if(ft && ft.home!=null){
       scores[game.key] = [ft.home, ft.away];
     }
@@ -788,19 +797,22 @@ async function syncScores(forceFullCheck){
       // duplicate placeholder games to reappear after being resolved.
       matches.forEach(m => {
         if(!m.score?.ft) return;
-        // Find the matching game in GAMES by team name (handles the case
-        // where our key differs from openfootball's if names were resolved
-        // via the hardcoded bracket instead of by openfootball itself)
         const game = GAMES.find(g => teamsMatch(g.team1, g.team2, m.team1, m.team2));
-        if(!game) return; // unknown fixture (e.g. still a placeholder for us) — skip
+        if(!game) return;
 
         const pen = m.score?.p || null;
+        const et = m.score?.et || null;
         if(pen){
-          const base = m.score?.et || m.score.ft;
+          // Penalties: ET score + penalty score combined per team
+          const base = et || m.score.ft;
           const combined = [base[0]+pen[0], base[1]+pen[1]];
           const penWinner = pen[0]>pen[1]?'home':'away';
           newScores[game.key] = [...combined, penWinner];
+        } else if(et){
+          // Extra time only (won in ET, no penalties): use ET score as final
+          newScores[game.key] = et;
         } else {
+          // Normal 90-min result
           newScores[game.key] = m.score.ft;
         }
       });
@@ -982,8 +994,10 @@ function renderGames(){
     html+=`<div class="round-header${playable?'':' future'}">${roundName}${badge}</div>`;
     games.forEach((g,i)=>{
       const a=actual[g.key],done=a&&a[0]!=null;
-      const wonOnPens = a && a[2]; // 'home' | 'away' if decided by penalties
-      const ftLabel = wonOnPens ? `${a[2]==='home'?g.team1:g.team2} won on pens · prediction total` : 'Full time';
+      const wonOnPens = a && a[2];
+      const ftLabel = wonOnPens
+        ? `${a[2]==='home'?g.team1:g.team2} won on pens · prediction total`
+        : g.hadET ? 'After extra time' : 'Full time';
       const scoreHtml=done
         ?`<div class="scorebox done"><div class="score-num">${a[0]} – ${a[1]}</div><span class="score-lbl">${ftLabel}</span></div>`
         :playable
